@@ -500,6 +500,113 @@ describe("openai-codex streaming", () => {
 		await streamResult.result();
 	});
 
+	it("strips partialJson from tool call blocks after finalisation", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
+		process.env.PI_CODING_AGENT_DIR = tempDir;
+		const token = mockToken();
+
+		const toolArgs = '{"path":"/tmp/foo.txt","contents":"hello"}';
+		const firstDelta = toolArgs.slice(0, 20);
+		const secondDelta = toolArgs.slice(20);
+
+		const sse = `${[
+			`data: ${JSON.stringify({
+				type: "response.output_item.added",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "write",
+					arguments: "",
+				},
+			})}`,
+			`data: ${JSON.stringify({ type: "response.function_call_arguments.delta", delta: firstDelta })}`,
+			`data: ${JSON.stringify({ type: "response.function_call_arguments.delta", delta: secondDelta })}`,
+			`data: ${JSON.stringify({ type: "response.function_call_arguments.done", arguments: toolArgs })}`,
+			`data: ${JSON.stringify({
+				type: "response.output_item.done",
+				item: {
+					type: "function_call",
+					id: "fc_1",
+					call_id: "call_1",
+					name: "write",
+					arguments: toolArgs,
+				},
+			})}`,
+			`data: ${JSON.stringify({
+				type: "response.completed",
+				response: {
+					status: "completed",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 3,
+						total_tokens: 8,
+						input_tokens_details: { cached_tokens: 0 },
+					},
+				},
+			})}`,
+		].join("\n\n")}\n\n`;
+
+		const encoder = new TextEncoder();
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(sse));
+				controller.close();
+			},
+		});
+
+		global.fetch = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
+				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
+			}
+			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
+			}
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				return new Response(stream, {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		}) as typeof fetch;
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Write a file", timestamp: Date.now() }],
+		};
+
+		const result = await streamOpenAICodexResponses(model, context, { apiKey: token }).result();
+
+		const toolCallBlock = result.content.find((c) => c.type === "toolCall");
+		expect(toolCallBlock).toBeDefined();
+		expect(toolCallBlock).toMatchObject({
+			type: "toolCall",
+			id: "call_1|fc_1",
+			name: "write",
+			arguments: { path: "/tmp/foo.txt", contents: "hello" },
+		});
+		// The streaming-phase buffer must not survive onto the persisted block —
+		// otherwise it is serialised to session files and replayed in future requests,
+		// doubling the context weight of every tool call.
+		expect((toolCallBlock as unknown as Record<string, unknown>).partialJson).toBeUndefined();
+		expect(result.stopReason).toBe("toolUse");
+	});
+
 	it("does not set conversation_id/session_id headers when sessionId is not provided", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;

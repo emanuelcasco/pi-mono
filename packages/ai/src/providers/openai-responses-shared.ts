@@ -459,6 +459,11 @@ export async function processResponsesStream<TApi extends Api>(
 					arguments: args,
 				};
 
+				if (currentBlock?.type === "toolCall") {
+					currentBlock.arguments = args;
+					delete (currentBlock as { partialJson?: string }).partialJson;
+				}
+
 				currentBlock = null;
 				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
 			}
